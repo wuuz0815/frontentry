@@ -1,0 +1,16 @@
+{
+  "name": "Tor öffnen",
+  "short_name": "Tor",
+  "description": "Öffnet das Tor per Bluetooth",
+  "lang": "de",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#1d3b2f",
+  "theme_color": "#1d3b2f",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
