@@ -7,7 +7,7 @@
 // =============================================================================
 "use strict";
 
-const APP_VERSION = "1.0.0";
+const APP_VERSION = "1.0.1";
 
 // ---------------------------------------------------------------------------
 // Konfiguration
@@ -18,6 +18,8 @@ const KONFIG = {
   impulsSekunden: 1,                     // Relais fällt nach dieser Zeit selbst ab
   benutzer: "admin",                     // Shelly-Benutzername ist fix
   zeitlimitMs: 8000,                     // Zeitlimit je Verbindungsschritt
+  verbindungsVersuche: 4,                // Wiederholungen bei Android-GATT-Fehler (Status 133)
+  pauseZwischenVersuchenMs: 700,         // Wartezeit vor jedem weiteren Versuch (wächst linear)
   blockGroesse: 180,                     // Byte je Schreibvorgang (bei Problemen auf 20 senken)
   quelle: "tor-app",                     // Absenderkennung im RPC-Aufruf
 };
@@ -280,15 +282,29 @@ async function torOeffnen(statusMelden) {
     statusMelden("Verbinde …");
     const [geraet, ausGespeichert] = await geraetErmitteln();
     rpc = new ShellyBleRpc(geraet);
-    try {
-      await rpc.verbinden();
-    } catch (e) {
+    let letzterFehler = null;
+    for (let versuch = 1; versuch <= KONFIG.verbindungsVersuche; versuch++) {
+      try {
+        if (versuch > 1) {
+          statusMelden(`Verbinde … (Versuch ${versuch})`);
+          await warten(KONFIG.pauseZwischenVersuchenMs * (versuch - 1));
+        }
+        await rpc.verbinden();
+        letzterFehler = null;
+        if (versuch > 1) log("INFO", `Verbindung im Versuch ${versuch} hergestellt`);
+        break;
+      } catch (e) {
+        letzterFehler = e;
+        log("WARNING", `Verbindungsversuch ${versuch}/${KONFIG.verbindungsVersuche} fehlgeschlagen: ${e.name || ""} ${e.message}`);
+        rpc.trennen();
+      }
+    }
+    if (letzterFehler) {
       if (ausGespeichert) {
         auswahlErzwingen = true;
-        log("WARNING", `Gespeichertes Gerät nicht erreichbar: ${e.message}`);
         return [false, "Tor nicht erreicht. Nochmal tippen und Gerät auswählen."];
       }
-      throw e;
+      throw letzterFehler;
     }
 
     statusMelden("Sende Befehl …");
