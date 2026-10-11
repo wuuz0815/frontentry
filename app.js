@@ -7,7 +7,7 @@
 // =============================================================================
 "use strict";
 
-const APP_VERSION = "1.0.1";
+const APP_VERSION = "1.0.2";
 
 // ---------------------------------------------------------------------------
 // Konfiguration
@@ -20,7 +20,9 @@ const KONFIG = {
   zeitlimitMs: 8000,                     // Zeitlimit je Verbindungsschritt
   verbindungsVersuche: 4,                // Wiederholungen bei Android-GATT-Fehler (Status 133)
   pauseZwischenVersuchenMs: 700,         // Wartezeit vor jedem weiteren Versuch (wächst linear)
-  blockGroesse: 180,                     // Byte je Schreibvorgang (bei Problemen auf 20 senken)
+  blockGroesse: 20,                      // Byte je Schreibvorgang (Shelly-Empfehlung)
+  pauseNachLaengeMs: 50,                 // Pause zwischen Längenangabe und Daten (Shelly-Empfehlung)
+  pauseNachVerbindungMs: 300,            // Android braucht nach dem Verbinden kurz Zeit für die Dienstsuche
   quelle: "tor-app",                     // Absenderkennung im RPC-Aufruf
 };
 
@@ -120,10 +122,12 @@ class ShellyBleRpc {
     this.geraet = geraet;
     this.zeichen = {};
     this.naechsteId = 1;
+    this.datenBegonnen = false;
   }
 
   async verbinden() {
     const server = await mitZeitlimit(this.geraet.gatt.connect(), KONFIG.zeitlimitMs, "Verbindungsaufbau");
+    await warten(KONFIG.pauseNachVerbindungMs);
     const dienst = await mitZeitlimit(server.getPrimaryService(UUID.dienst), KONFIG.zeitlimitMs, "RPC-Dienst");
     this.zeichen.daten = await dienst.getCharacteristic(UUID.daten);
     this.zeichen.tx = await dienst.getCharacteristic(UUID.txSteuerung);
@@ -147,6 +151,10 @@ class ShellyBleRpc {
     const laenge = new Uint8Array(4);
     new DataView(laenge.buffer).setUint32(0, bytes.length, false);
     await this.zeichen.tx.writeValueWithResponse(laenge);
+    await warten(KONFIG.pauseNachLaengeMs);
+    // Ab hier kann der Shelly den Befehl ausführen: keine automatische Wiederholung mehr,
+    // sonst droht ein zweiter Impuls (Tor stoppt oder fährt zurück).
+    this.datenBegonnen = true;
     for (let i = 0; i < bytes.length; i += KONFIG.blockGroesse) {
       await this.zeichen.daten.writeValueWithResponse(bytes.slice(i, i + KONFIG.blockGroesse));
     }
@@ -282,6 +290,8 @@ async function torOeffnen(statusMelden) {
     statusMelden("Verbinde …");
     const [geraet, ausGespeichert] = await geraetErmitteln();
     rpc = new ShellyBleRpc(geraet);
+    const params = { id: KONFIG.schalterId, on: true, toggle_after: KONFIG.impulsSekunden };
+    let antwort = null;
     let letzterFehler = null;
     for (let versuch = 1; versuch <= KONFIG.verbindungsVersuche; versuch++) {
       try {
@@ -290,13 +300,19 @@ async function torOeffnen(statusMelden) {
           await warten(KONFIG.pauseZwischenVersuchenMs * (versuch - 1));
         }
         await rpc.verbinden();
+        statusMelden("Sende Befehl …");
+        antwort = await rpc.aufrufen("Switch.Set", params);
         letzterFehler = null;
-        if (versuch > 1) log("INFO", `Verbindung im Versuch ${versuch} hergestellt`);
+        if (versuch > 1) log("INFO", `Erfolgreich im Versuch ${versuch}`);
         break;
       } catch (e) {
         letzterFehler = e;
-        log("WARNING", `Verbindungsversuch ${versuch}/${KONFIG.verbindungsVersuche} fehlgeschlagen: ${e.name || ""} ${e.message}`);
+        log("WARNING", `Versuch ${versuch}/${KONFIG.verbindungsVersuche} fehlgeschlagen: ${e.name || ""} ${e.message}`);
         rpc.trennen();
+        if (rpc.datenBegonnen) {
+          log("WARNING", "Befehl war bereits unterwegs, keine Wiederholung (Schutz vor Doppelimpuls)");
+          return [false, "Unklar, ob das Tor reagiert hat. Bitte schauen und bei Bedarf nochmal tippen."];
+        }
       }
     }
     if (letzterFehler) {
@@ -306,10 +322,6 @@ async function torOeffnen(statusMelden) {
       }
       throw letzterFehler;
     }
-
-    statusMelden("Sende Befehl …");
-    const params = { id: KONFIG.schalterId, on: true, toggle_after: KONFIG.impulsSekunden };
-    let antwort = await rpc.aufrufen("Switch.Set", params);
     let neuerZugang = null;
 
     const herausforderung = herausforderungLesen(antwort);
@@ -435,7 +447,7 @@ function oberflaecheStarten() {
   }
 
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register(`sw.js?v=${APP_VERSION}`).then(
+    navigator.serviceWorker.register(`sw.js?v=${APP_VERSION}`, { updateViaCache: "none" }).then(
       () => log("DEBUG", "Offline-Zwischenspeicher aktiv"),
       (e) => log("WARNING", `Offline-Zwischenspeicher nicht aktiv: ${e.message}`)
     );
