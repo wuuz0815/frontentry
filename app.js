@@ -7,7 +7,7 @@
 // =============================================================================
 "use strict";
 
-const APP_VERSION = "1.1.1";
+const APP_VERSION = "1.1.2";
 
 // ---------------------------------------------------------------------------
 // Konfiguration
@@ -46,6 +46,9 @@ const SPEICHER_GERAET = "tor_geraet_v1";  // ID des gewählten Bluetooth-Geräts
 // Nur im Arbeitsspeicher, max. 200 Zeilen, keine Geheimnisse.
 // ---------------------------------------------------------------------------
 const logPuffer = [];
+const MELDUNG_NICHT_GEKOPPELT =
+  "Dieses Handy ist nicht mit dem Shelly gekoppelt. Am Shelly unter Settings → Bluetooth " +
+  "„Pair new device“ starten, dann hier innerhalb von 3 Minuten „Tor öffnen“ tippen und das Koppeln bestätigen.";
 let kleineBloecke = false; // wird gesetzt, wenn der Shelly große Blöcke ablehnt
 let debugModus = false;
 
@@ -411,6 +414,12 @@ async function torOeffnen(statusMelden) {
         letzterFehler = e;
         log("WARNING", `Versuch ${versuch}/${KONFIG.verbindungsVersuche} fehlgeschlagen bei „${rpc.schritt}“: ${meldungKlartext(e.message)} (${e.name || "Fehler"})`);
         rpc.trennen();
+        // Shelly (Firmware 2.x) lehnt Befehle nicht gekoppelter Handys schon bei der
+        // Längenangabe mit „invalid attribute length“ ab. Wiederholen ist dann sinnlos.
+        if (rpc.schritt.startsWith("Längenangabe") && e.name === "InvalidModificationError") {
+          log("ERROR", "Handy ist nicht mit dem Shelly gekoppelt, Abbruch ohne weitere Versuche");
+          return [false, MELDUNG_NICHT_GEKOPPELT];
+        }
         if (rpc.datenBegonnen) {
           log("WARNING", "Befehl war bereits unterwegs, keine Wiederholung (Schutz vor Doppelimpuls)");
           return [false, "Unklar, ob das Tor reagiert hat. Bitte schauen und bei Bedarf nochmal tippen."];
