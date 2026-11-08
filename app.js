@@ -7,7 +7,7 @@
 // =============================================================================
 "use strict";
 
-const APP_VERSION = "1.0.2";
+const APP_VERSION = "1.1.0";
 
 // ---------------------------------------------------------------------------
 // Konfiguration
@@ -20,9 +20,13 @@ const KONFIG = {
   zeitlimitMs: 8000,                     // Zeitlimit je Verbindungsschritt
   verbindungsVersuche: 4,                // Wiederholungen bei Android-GATT-Fehler (Status 133)
   pauseZwischenVersuchenMs: 700,         // Wartezeit vor jedem weiteren Versuch (wächst linear)
-  blockGroesse: 20,                      // Byte je Schreibvorgang (Shelly-Empfehlung)
+  blockGroesse: 20,                      // kleinste Blockgröße (Rückfall)
+  blockGross: 180,                       // bevorzugte Blockgröße, Chrome handelt die MTU selbst aus
+  txWiederholungen: 4,                   // Längenangabe in derselben Verbindung erneut senden
+  txPauseMs: 150,                        // Wartezeit, bis die Verschlüsselung steht
   pauseNachLaengeMs: 50,                 // Pause zwischen Längenangabe und Daten (Shelly-Empfehlung)
-  pauseNachVerbindungMs: 300,            // Android braucht nach dem Verbinden kurz Zeit für die Dienstsuche
+  pauseNachVerbindungMs: 300,
+  werbungWartenMs: 4000,                 // max. Wartezeit auf ein Lebenszeichen des gemerkten Geräts            // Android braucht nach dem Verbinden kurz Zeit für die Dienstsuche
   quelle: "tor-app",                     // Absenderkennung im RPC-Aufruf
 };
 
@@ -42,6 +46,7 @@ const SPEICHER_GERAET = "tor_geraet_v1";  // ID des gewählten Bluetooth-Geräts
 // Nur im Arbeitsspeicher, max. 200 Zeilen, keine Geheimnisse.
 // ---------------------------------------------------------------------------
 const logPuffer = [];
+let kleineBloecke = false; // wird gesetzt, wenn der Shelly große Blöcke ablehnt
 let debugModus = false;
 
 function zeitstempel() {
@@ -136,10 +141,12 @@ class ShellyBleRpc {
   }
 
   trennen() {
+    // Immer trennen, auch wenn Chrome die Verbindung schon als getrennt meldet:
+    // gibt halb aufgebaute Verbindungen frei, die sonst weitere Versuche blockieren.
     try {
-      if (this.geraet && this.geraet.gatt && this.geraet.gatt.connected) {
+      if (this.geraet && this.geraet.gatt) {
         this.geraet.gatt.disconnect();
-        log("DEBUG", "Bluetooth-Verbindung getrennt");
+        log("DEBUG", "Bluetooth-Verbindung freigegeben");
       }
     } catch (e) {
       log("DEBUG", `Trennen fehlgeschlagen: ${e.message}`);
@@ -150,15 +157,42 @@ class ShellyBleRpc {
     const bytes = new TextEncoder().encode(JSON.stringify(objekt));
     const laenge = new Uint8Array(4);
     new DataView(laenge.buffer).setUint32(0, bytes.length, false);
-    await this.zeichen.tx.writeValueWithResponse(laenge);
-    await warten(KONFIG.pauseNachLaengeMs);
-    // Ab hier kann der Shelly den Befehl ausführen: keine automatische Wiederholung mehr,
-    // sonst droht ein zweiter Impuls (Tor stoppt oder fährt zurück).
-    this.datenBegonnen = true;
-    for (let i = 0; i < bytes.length; i += KONFIG.blockGroesse) {
-      await this.zeichen.daten.writeValueWithResponse(bytes.slice(i, i + KONFIG.blockGroesse));
+    // Längenangabe: wird direkt nach dem Verbinden gelegentlich abgelehnt, solange die
+    // Verschlüsselung noch aufgebaut wird. Erneutes Senden ist gefahrlos.
+    for (let versuch = 1; ; versuch++) {
+      try {
+        await this.zeichen.tx.writeValueWithResponse(laenge);
+        if (versuch > 1) log("DEBUG", `Längenangabe im ${versuch}. Anlauf angenommen`);
+        break;
+      } catch (e) {
+        if (versuch >= KONFIG.txWiederholungen || !this.geraet.gatt.connected) throw e;
+        log("DEBUG", `Längenangabe abgelehnt (${e.message}), neuer Anlauf in derselben Verbindung`);
+        await warten(KONFIG.txPauseMs * versuch);
+      }
     }
-    log("DEBUG", `Rahmen gesendet (${bytes.length} Byte)`);
+    await warten(KONFIG.pauseNachLaengeMs);
+    const block = kleineBloecke ? KONFIG.blockGroesse : KONFIG.blockGross;
+    let bloecke = 0;
+    for (let i = 0; i < bytes.length; i += block) {
+      const ende = Math.min(i + block, bytes.length);
+      // Erst vor dem letzten Block kann der Shelly ausführen: ab hier keine automatische
+      // Wiederholung mehr, sonst droht ein zweiter Impuls (Tor stoppt oder fährt zurück).
+      if (ende === bytes.length) this.datenBegonnen = true;
+      try {
+        await this.zeichen.daten.writeValueWithResponse(bytes.slice(i, ende));
+      } catch (e) {
+        // Verbindung steht noch = Shelly hat den Block abgelehnt, also nichts ausgeführt.
+        // Dann ist eine Wiederholung gefahrlos.
+        if (this.geraet.gatt.connected) this.datenBegonnen = false;
+        if (block > KONFIG.blockGroesse && !kleineBloecke) {
+          kleineBloecke = true;
+          log("WARNING", `Große Datenblöcke abgelehnt, ab jetzt ${KONFIG.blockGroesse}-Byte-Blöcke`);
+        }
+        throw e;
+      }
+      bloecke++;
+    }
+    log("DEBUG", `Rahmen gesendet (${bytes.length} Byte in ${bloecke} Block/Blöcken)`);
   }
 
   async rahmenEmpfangen() {
@@ -236,21 +270,65 @@ let gemerktesGeraet = null;
 let auswahlErzwingen = false;
 let einrichtungsPasswort = null; // nur im Arbeitsspeicher, wird nach Erfolg verworfen
 
-async function geraetErmitteln() {
-  if (gemerktesGeraet && !auswahlErzwingen) return [gemerktesGeraet, false];
+/**
+ * Prüft, ob Chrome sich freigegebene Geräte merken kann (Funktion getDevices).
+ * @returns {[boolean, string]}
+ */
+function geraetMerkenVerfuegbar() {
+  if (navigator.bluetooth && typeof navigator.bluetooth.getDevices === "function") {
+    return [true, "Chrome merkt sich das Gerät, kein Auswahldialog nötig"];
+  }
+  return [false, "Chrome kann sich das Gerät nicht merken. Flag 'enable-web-bluetooth-new-permissions-backend' aktivieren"];
+}
+
+/**
+ * Wartet, bis das gemerkte Gerät in Reichweite funkt. Chrome braucht dieses
+ * Lebenszeichen, bevor es ein Gerät ohne Auswahldialog verbinden kann.
+ */
+async function aufWerbungWarten(geraet) {
+  if (typeof geraet.watchAdvertisements !== "function") {
+    log("DEBUG", "watchAdvertisements nicht verfügbar, verbinde direkt");
+    return [true, "übersprungen"];
+  }
+  const abbruch = new AbortController();
+  try {
+    const empfangen = new Promise((erfuellen) => {
+      geraet.addEventListener("advertisementreceived", () => erfuellen(true), { once: true });
+    });
+    await geraet.watchAdvertisements({ signal: abbruch.signal });
+    const ergebnis = await Promise.race([empfangen, warten(KONFIG.werbungWartenMs).then(() => false)]);
+    return ergebnis ? [true, "Gerät in Reichweite"] : [false, "Gerät meldet sich nicht"];
+  } catch (e) {
+    log("DEBUG", `watchAdvertisements fehlgeschlagen: ${e.message}`);
+    return [true, "übersprungen"];
+  } finally {
+    abbruch.abort();
+  }
+}
+
+async function geraetErmitteln(statusMelden = () => {}) {
+  if (gemerktesGeraet && !auswahlErzwingen) return [gemerktesGeraet, true];
 
   const gespeicherteId = speicherLesen(SPEICHER_GERAET);
-  if (!auswahlErzwingen && gespeicherteId && navigator.bluetooth.getDevices) {
+  const [merkbar, merkHinweis] = geraetMerkenVerfuegbar();
+  if (!merkbar) log("WARNING", merkHinweis);
+
+  if (!auswahlErzwingen && gespeicherteId && merkbar) {
     try {
       const liste = await navigator.bluetooth.getDevices();
       const treffer = liste.find((g) => g.id === gespeicherteId);
       if (treffer) {
         log("DEBUG", "Bekanntes Gerät ohne Auswahldialog gefunden");
+        statusMelden("Suche Tor …");
+        const [inReichweite, meldung] = await aufWerbungWarten(treffer);
+        log("DEBUG", `Reichweitenprüfung: ${meldung}`);
+        if (!inReichweite) log("WARNING", "Gemerktes Gerät meldet sich nicht, Verbindungsversuch trotzdem");
         gemerktesGeraet = treffer;
         return [treffer, true];
       }
+      log("WARNING", `Gemerktes Gerät nicht in der Freigabeliste (${liste.length} Einträge)`);
     } catch (e) {
-      log("DEBUG", `getDevices nicht verfügbar: ${e.message}`);
+      log("WARNING", `getDevices fehlgeschlagen: ${e.message}`);
     }
   }
 
@@ -265,8 +343,24 @@ async function geraetErmitteln() {
   return [geraet, false];
 }
 
+/** Übersetzt typische Chrome-Bluetooth-Meldungen in verständlichen Text. */
+function meldungKlartext(text) {
+  const t = String(text || "");
+  if (/unknown reason/i.test(t)) return "Bluetooth-Fehler ohne nähere Angabe (GATT Error Unknown)";
+  if (/no longer in range/i.test(t)) return "Shelly nicht in Reichweite";
+  if (/GATT Server is disconnected/i.test(t)) return "Verbindung vom Shelly getrennt";
+  if (/Connection attempt failed/i.test(t)) return "Verbindungsaufbau gescheitert";
+  if (/not paired|insufficient (authentication|encryption)/i.test(t)) return "Handy nicht (mehr) gekoppelt – neu koppeln";
+  if (/already in progress/i.test(t)) return "Bluetooth noch mit vorigem Vorgang beschäftigt";
+  return t;
+}
+
 function fehlerUebersetzen(fehler) {
   const name = fehler && fehler.name;
+  const text = fehler && fehler.message;
+  if (/not paired|insufficient (authentication|encryption)/i.test(text || "")) {
+    return "Handy ist nicht (mehr) mit dem Shelly gekoppelt. Kopplung am Shelly und in den Android-Bluetooth-Einstellungen erneuern.";
+  }
   if (name === "NotFoundError") return "Kein Gerät ausgewählt.";
   if (name === "NotAllowedError") return "Bluetooth-Zugriff wurde nicht erlaubt.";
   if (name === "NetworkError") return "Verbindung fehlgeschlagen. Näher ans Tor gehen und nochmal tippen.";
@@ -288,7 +382,7 @@ async function torOeffnen(statusMelden) {
     }
 
     statusMelden("Verbinde …");
-    const [geraet, ausGespeichert] = await geraetErmitteln();
+    const [geraet, ausGespeichert] = await geraetErmitteln(statusMelden);
     rpc = new ShellyBleRpc(geraet);
     const params = { id: KONFIG.schalterId, on: true, toggle_after: KONFIG.impulsSekunden };
     let antwort = null;
@@ -307,7 +401,7 @@ async function torOeffnen(statusMelden) {
         break;
       } catch (e) {
         letzterFehler = e;
-        log("WARNING", `Versuch ${versuch}/${KONFIG.verbindungsVersuche} fehlgeschlagen: ${e.name || ""} ${e.message}`);
+        log("WARNING", `Versuch ${versuch}/${KONFIG.verbindungsVersuche} fehlgeschlagen: ${meldungKlartext(e.message)} (${e.name || "Fehler"})`);
         rpc.trennen();
         if (rpc.datenBegonnen) {
           log("WARNING", "Befehl war bereits unterwegs, keine Wiederholung (Schutz vor Doppelimpuls)");
@@ -362,6 +456,25 @@ async function torOeffnen(statusMelden) {
   } finally {
     if (rpc) rpc.trennen();
     log("INFO", "=== Aktion abgeschlossen: Tor öffnen ===");
+  }
+}
+
+function geraeteInfo() {
+  const ua = navigator.userAgent || "";
+  const android = (ua.match(/Android [\d.]+/) || ["?"])[0];
+  const modell = (ua.match(/Android [\d.]+; ([^;)]+)/) || [])[1] || "unbekanntes Gerät";
+  const chrome = (ua.match(/Chrome\/([\d]+)/) || [])[1] || "?";
+  return `${modell}, ${android}, Chrome ${chrome}`;
+}
+
+async function protokollTeilen() {
+  const text = `Tor-Steuerung ${APP_VERSION} – ${geraeteInfo()}\n\n${logPuffer.join("\n")}`;
+  try {
+    if (navigator.share) { await navigator.share({ title: "Tor-Steuerung Protokoll", text }); return [true, "Geteilt"]; }
+    await navigator.clipboard.writeText(text);
+    return [true, "Protokoll in die Zwischenablage kopiert"];
+  } catch (e) {
+    return [false, `Teilen nicht möglich: ${e.message}`];
   }
 }
 
@@ -433,6 +546,11 @@ function oberflaecheStarten() {
     log("INFO", "Geräteauswahl zurückgesetzt");
   });
 
+  $("btnTeilen").addEventListener("click", async () => {
+    const [ok, meldung] = await protokollTeilen();
+    if (!ok) status(meldung, "fehler");
+  });
+
   $("btnZuruecksetzen").addEventListener("click", () => {
     speicherLoeschen(SPEICHER_ZUGANG);
     speicherLoeschen(SPEICHER_GERAET);
@@ -452,7 +570,13 @@ function oberflaecheStarten() {
       (e) => log("WARNING", `Offline-Zwischenspeicher nicht aktiv: ${e.message}`)
     );
   }
-  log("INFO", `Tor-Steuerung ${APP_VERSION} gestartet`);
+  log("INFO", `Tor-Steuerung ${APP_VERSION} gestartet (${geraeteInfo()})`);
+  if (navigator.bluetooth) {
+    const [merkbar, hinweis] = geraetMerkenVerfuegbar();
+    log(merkbar ? "INFO" : "WARNING", hinweis);
+    const el = $("merkHinweis");
+    if (el) { el.textContent = merkbar ? "Gerät merken: aktiv" : "Gerät merken: nicht aktiv (Chrome-Flag fehlt)"; }
+  }
 }
 
 if (typeof document !== "undefined") {
