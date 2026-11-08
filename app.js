@@ -7,7 +7,7 @@
 // =============================================================================
 "use strict";
 
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.1.1";
 
 // ---------------------------------------------------------------------------
 // Konfiguration
@@ -21,7 +21,7 @@ const KONFIG = {
   verbindungsVersuche: 4,                // Wiederholungen bei Android-GATT-Fehler (Status 133)
   pauseZwischenVersuchenMs: 700,         // Wartezeit vor jedem weiteren Versuch (wächst linear)
   blockGroesse: 20,                      // kleinste Blockgröße (Rückfall)
-  blockGross: 180,                       // bevorzugte Blockgröße, Chrome handelt die MTU selbst aus
+  blockGross: 20,                        // 180 Byte scheiterte unter Android 10 („invalid attribute length“)
   txWiederholungen: 4,                   // Längenangabe in derselben Verbindung erneut senden
   txPauseMs: 150,                        // Wartezeit, bis die Verschlüsselung steht
   pauseNachLaengeMs: 50,                 // Pause zwischen Längenangabe und Daten (Shelly-Empfehlung)
@@ -128,11 +128,14 @@ class ShellyBleRpc {
     this.zeichen = {};
     this.naechsteId = 1;
     this.datenBegonnen = false;
+    this.schritt = "Verbindungsaufbau"; // für verständliche Fehlermeldungen
   }
 
   async verbinden() {
+    this.schritt = "Verbindungsaufbau";
     const server = await mitZeitlimit(this.geraet.gatt.connect(), KONFIG.zeitlimitMs, "Verbindungsaufbau");
     await warten(KONFIG.pauseNachVerbindungMs);
+    this.schritt = "Dienstsuche";
     const dienst = await mitZeitlimit(server.getPrimaryService(UUID.dienst), KONFIG.zeitlimitMs, "RPC-Dienst");
     this.zeichen.daten = await dienst.getCharacteristic(UUID.daten);
     this.zeichen.tx = await dienst.getCharacteristic(UUID.txSteuerung);
@@ -160,6 +163,7 @@ class ShellyBleRpc {
     // Längenangabe: wird direkt nach dem Verbinden gelegentlich abgelehnt, solange die
     // Verschlüsselung noch aufgebaut wird. Erneutes Senden ist gefahrlos.
     for (let versuch = 1; ; versuch++) {
+      this.schritt = `Längenangabe (${bytes.length} Byte angekündigt, Anlauf ${versuch})`;
       try {
         await this.zeichen.tx.writeValueWithResponse(laenge);
         if (versuch > 1) log("DEBUG", `Längenangabe im ${versuch}. Anlauf angenommen`);
@@ -178,6 +182,7 @@ class ShellyBleRpc {
       // Erst vor dem letzten Block kann der Shelly ausführen: ab hier keine automatische
       // Wiederholung mehr, sonst droht ein zweiter Impuls (Tor stoppt oder fährt zurück).
       if (ende === bytes.length) this.datenBegonnen = true;
+      this.schritt = `Datenblock ${bloecke + 1}/${Math.ceil(bytes.length / block)} (${ende - i} Byte)`;
       try {
         await this.zeichen.daten.writeValueWithResponse(bytes.slice(i, ende));
       } catch (e) {
@@ -196,6 +201,7 @@ class ShellyBleRpc {
   }
 
   async rahmenEmpfangen() {
+    this.schritt = "Antwortlänge lesen";
     const start = Date.now();
     let laenge = 0;
     while (Date.now() - start < KONFIG.zeitlimitMs) {
@@ -208,6 +214,7 @@ class ShellyBleRpc {
 
     const teile = [];
     let empfangen = 0;
+    this.schritt = "Antwort lesen";
     while (empfangen < laenge) {
       const wert = await this.zeichen.daten.readValue();
       const teil = new Uint8Array(wert.buffer, wert.byteOffset, wert.byteLength).slice();
@@ -352,6 +359,7 @@ function meldungKlartext(text) {
   if (/Connection attempt failed/i.test(t)) return "Verbindungsaufbau gescheitert";
   if (/not paired|insufficient (authentication|encryption)/i.test(t)) return "Handy nicht (mehr) gekoppelt – neu koppeln";
   if (/already in progress/i.test(t)) return "Bluetooth noch mit vorigem Vorgang beschäftigt";
+  if (/invalid attribute length/i.test(t)) return "Shelly lehnt die Länge der Daten ab (invalid attribute length)";
   return t;
 }
 
@@ -401,7 +409,7 @@ async function torOeffnen(statusMelden) {
         break;
       } catch (e) {
         letzterFehler = e;
-        log("WARNING", `Versuch ${versuch}/${KONFIG.verbindungsVersuche} fehlgeschlagen: ${meldungKlartext(e.message)} (${e.name || "Fehler"})`);
+        log("WARNING", `Versuch ${versuch}/${KONFIG.verbindungsVersuche} fehlgeschlagen bei „${rpc.schritt}“: ${meldungKlartext(e.message)} (${e.name || "Fehler"})`);
         rpc.trennen();
         if (rpc.datenBegonnen) {
           log("WARNING", "Befehl war bereits unterwegs, keine Wiederholung (Schutz vor Doppelimpuls)");
